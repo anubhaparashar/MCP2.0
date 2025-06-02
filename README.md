@@ -666,24 +666,367 @@ Lists all Python dependencies.
 
 ________________________________________
 
+**2. Protobuf Definitions (protos/mcp2.proto)**
+
+Create mcp2_project/protos/mcp2.proto with the following content:
+
+```
+syntax = "proto3";
+package mcp2;
+
+// ------------------------------------------------------------------
+// 1. Discovery Service
+// ------------------------------------------------------------------
+service Discovery {
+  // Register this server (or agent) & its capabilities with the registry
+  rpc Register(RegisterRequest) returns (RegisterResponse);
+
+  // Given a capability filter, return matching endpoints
+  rpc Lookup(LookupRequest) returns (LookupResponse);
+}
+
+message RegisterRequest {
+  string server_name = 1;                 // e.g., "InventoryDB_Primary"
+  repeated string capabilities = 2;       // e.g., ["db:inventory:read", "event:publish:inventory:*"]
+  string registration_token = 3;          // JWT proving identity/rights
+}
+
+message RegisterResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message LookupRequest {
+  string requester_token = 1;             // JWT proving caller’s identity & rights
+  repeated string capability_filter = 2;  // e.g., ["db:inventory:read"]
+}
+
+message LookupResponse {
+  repeated EndpointDescriptor endpoints = 1;
+}
+
+message EndpointDescriptor {
+  string server_name = 1;                 // e.g., "InventoryDB_Replica1"
+  string grpc_url = 2;                    // e.g., "localhost:50051"
+  repeated string capabilities = 3;       // e.g., ["db:inventory:read"]
+}
+
+// ------------------------------------------------------------------
+// 2. Core Context/Tool Service
+// ------------------------------------------------------------------
+service ContextTool {
+  // Unary: request some context
+  rpc RequestContext(ContextRequest) returns (ContextResponse);
+
+  // Server‐streaming: subscribe to live telemetry
+  rpc SubscribeTelemetry(TelemetryRequest) returns (stream TelemetryFrame);
+
+  // Bidirectional‐stream: exchange multimodal data
+  rpc MultiModalExchange(stream MultiModalFrame) returns (stream MultiModalFrame);
+
+  // Unary: invoke a specific tool or action
+  rpc InvokeTool(ToolRequest) returns (ToolResponse);
+}
+
+message ContextRequest {
+  string context_key = 1;             // e.g., "inventory:prod_12345:stock_count"
+  map<string, string> parameters = 2; // simple key→value pairs (for clarity)
+  string capability_token = 3;        // JWT with "db:inventory:read" scope
+  string agent_delegation_proof = 4;  // if delegated by another agent (signed JWT)
+}
+
+message ContextResponse {
+  bytes serialized_value = 1;         // e.g., protobuf or JSON‐encoded data blob
+  repeated string metadata = 2;       // e.g., ["timestamp:2025-06-01T08:00:00Z"]
+}
+
+message TelemetryRequest {
+  string stream_id = 1;               // e.g., "fleet123:engine_temp"
+  string capability_token = 2;        // must include "telemetry:read" scope
+}
+
+message TelemetryFrame {
+  int64 timestamp_ms = 1;
+  bytes payload = 2;                  // raw sensor data (e.g., JSON‐encoded)
+}
+
+message MultiModalFrame {
+  oneof data {
+    TextChunk text = 1;
+    ImageFrame image = 2;
+    AudioFrame audio = 3;
+    BinaryBlob blob = 4;
+  }
+}
+
+message TextChunk {
+  string content = 1;
+  int32 sequence = 2;                 // ordering for reassembly
+}
+
+message ImageFrame {
+  bytes jpeg_data = 1;
+  int32 width = 2;
+  int32 height = 3;
+  int32 sequence = 4;
+}
+
+message AudioFrame {
+  bytes pcm_data = 1;
+  int64 timestamp_ms = 2;
+}
+
+message BinaryBlob {
+  bytes data = 1;
+  string mime_type = 2;               // e.g., "application/pdf"
+  int32 sequence = 3;
+}
+
+message ToolRequest {
+  string tool_name = 1;               // e.g., "enhance_image", "sql_query"
+  map<string, string> arguments = 2;  // key→string_value pairs for simplicity
+  string capability_token = 3;        // must include "tool:..." scope
+  string agent_delegation_proof = 4;  // if invoked by another agent
+}
+
+message ToolResponse {
+  bool success = 1;
+  map<string, bytes> outputs = 2;     // e.g., {"enhanced_image": <JPEG bytes>}
+  repeated string warnings = 3;
+}
+
+// ------------------------------------------------------------------
+// 3. EventBus Service (Publish/Subscribe)
+// ------------------------------------------------------------------
+service EventBus {
+  // Publisher publishes events under a topic
+  rpc Publish(EventPublishRequest) returns (EventPublishResponse);
+
+  // Subscriber opens a stream to receive events matching topics
+  rpc Subscribe(EventSubscribeRequest) returns (stream EventEnvelope);
+}
+
+message EventPublishRequest {
+  string topic = 1;              // e.g., "inventory:prod_12345:low_stock"
+  bytes payload = 2;             // JSON‐encoded or Protobuf data
+  string publisher_token = 3;    // JWT must include "event:publish:<topic_pattern>"
+}
+
+message EventPublishResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message EventSubscribeRequest {
+  string topic_filter = 1;       // e.g., "inventory:*:low_stock"
+  string subscriber_token = 2;   // JWT must include "event:subscribe:<topic_pattern>"
+}
+
+message EventEnvelope {
+  string topic = 1;
+  bytes payload = 2;
+  int64 sequence_id = 3;
+}
+```
+
+Save that file as:
+
+```
+
+mcp2_project/protos/mcp2.proto
+
+```
+
+________________________________________
+
+**3. Code Generation Instructions**
+
+From the project root (mcp2_project/), run:
+
+```
+
+# 1. Create a Python virtual environment (optional but recommended):
+python3 -m venv venv
+source venv/bin/activate
+
+# 2. Install dependencies for compilation and runtime:
+pip install grpcio grpcio-tools protobuf PyJWT
+
+# 3. Generate Python code from the .proto:
+python -m grpc_tools.protoc \
+    --proto_path=protos \
+    --python_out=. \
+    --grpc_python_out=. \
+    protos/mcp2.proto
+
+
+```
+This produces two files under mcp2_project/:
+
+```
+
+mcp2_pb2.py
+mcp2_pb2_grpc.py
+
+
+```
+
+These contain all of our message classes and service stubs.
+
+
+
 
 
 ________________________________________
 
+**4. requirements.txt**
+
+For reference, here is a minimal requirements.txt:
+
+```
+
+grpcio==1.56.0
+grpcio-tools==1.56.0
+protobuf==4.23.4
+PyJWT==2.8.0
 
 
+```
+
+You can install via:
+
+```
+
+pip install -r requirements.txt
+
+
+```
 
 ________________________________________
 
+**5. Authentication Module (auth.py)**
+
+We’ll use JWTs (with HS256) to encode capability‐based tokens. In production, you’d likely use asymmetric keys (RS256) or macaroons, but for clarity we’ll use a shared secret.
+
+Create mcp2_project/auth.py:
+
+```
+
+# auth.py
+import jwt
+import time
+from typing import List, Dict, Any
+
+# ------------------------------------------------------------------
+# Configuration / Secret Key (in prod, store this securely)
+# ------------------------------------------------------------------
+SECRET_KEY = "supersecret_mcp2_key"  # Replace with a secure, random key
+ALGORITHM = "HS256"
+
+# ------------------------------------------------------------------
+# Helper: Create a capability token (JWT)
+# ------------------------------------------------------------------
+def create_capability_token(
+    subject: str,
+    capabilities: List[str],
+    audience: List[str],
+    expires_in_sec: int = 3600
+) -> str:
+    """
+    Issue a JWT that encodes:
+      - sub: the subject (agent or server ID)
+      - capabilities: list of capability strings (e.g., "db:inventory:read")
+      - aud: allowed recipients (e.g., ["InventoryDB_*"])
+      - exp: expiration timestamp
+    """
+    now = int(time.time())
+    payload = {
+        "sub": subject,
+        "capabilities": capabilities,
+        "aud": audience,
+        "iat": now,
+        "exp": now + expires_in_sec
+    }
+    token = jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+    return token
+
+# ------------------------------------------------------------------
+# Helper: Verify a token and return payload if valid
+# ------------------------------------------------------------------
+def verify_capability_token(token: str) -> Dict[str, Any]:
+    """
+    Verifies JWT signature, expiration, and returns payload.
+    Raises jwt.ExpiredSignatureError or jwt.InvalidTokenError on failure.
+    """
+    try:
+        payload = jwt.decode(
+            token,
+            SECRET_KEY,
+            algorithms=[ALGORITHM],
+            options={"require": ["exp", "iat", "sub", "capabilities", "aud"]}
+        )
+        return payload
+    except jwt.ExpiredSignatureError as e:
+        raise
+    except jwt.InvalidTokenError as e:
+        raise
+
+# ------------------------------------------------------------------
+# Helper: Check if a given capability is present
+# ------------------------------------------------------------------
+def has_capability(payload: Dict[str, Any], required: str) -> bool:
+    """
+    Returns True if 'required' is an exact match or matches a wildcard
+    against any entry in payload["capabilities"].
+    Wildcard pattern: "db:inventory:*" matches "db:inventory:read" etc.
+    """
+    caps = payload.get("capabilities", [])
+    for cap in caps:
+        if cap == required:
+            return True
+        # simple wildcard check: "db:inventory:*"
+        if cap.endswith("*"):
+            prefix = cap[:-1]
+            if required.startswith(prefix):
+                return True
+    return False
+
+# ------------------------------------------------------------------
+# Helper: Check audience
+# ------------------------------------------------------------------
+def has_audience(payload: Dict[str, Any], target: str) -> bool:
+    """
+    Returns True if target matches any entry in payload["aud"], allowing wildcard.
+    """
+    aud_list = payload.get("aud", [])
+    for aud in aud_list:
+        if aud == target:
+            return True
+        if aud.endswith("*"):
+            prefix = aud[:-1]
+            if target.startswith(prefix):
+                return True
+    return False
 
 
+```
+Notes on auth.py:
 
+-create_capability_token(...) issues a JWT containing:
 
-________________________________________
+  -sub (subject, e.g. agent/server ID)
 
+  -capabilities (list of strings like "db:inventory:read", "event:publish:inventory:*")
 
+  -aud (audience list, e.g. ["InventoryDB_*"])
 
+  -iat, exp (issued‐at & expiration)
 
+-verify_capability_token(token) decodes & verifies signature/expiry.
+
+-has_capability(payload, required) checks if a capability or wildcard matches.
+
+-has_audience(payload, target) checks if the JWT’s aud matches a given server name (allowing wildcard).
 
 ________________________________________
 
