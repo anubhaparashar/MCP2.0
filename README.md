@@ -1,47 +1,60 @@
 # MCP2.0
-1. Key Limitations of MCP
-1.	JSON-RPC Overhead & Lack of IPA-Grade Typing
+**1. Key Limitations of MCP**
+
+**1.	JSON-RPC Overhead & Lack of IPA-Grade Typing**
 o	MCP’s reliance on JSON-RPC 2.0 makes it easy to implement in any language, but it also incurs significant parsing overhead for large payloads.
 o	Because JSON is untyped, both client and server need to agree on schemas out‐of‐band. This can lead to runtime errors when an unsupported field or type sneaks through.
-2.	Limited Native Streaming Support
+
+**2.	Limited Native Streaming Support**
 o	Most MCP servers/clients treat each request/response as self‐contained. Streaming large datasets (e.g., hundreds of megabytes of logs, long audio transcripts, or real-time telemetry) often becomes a clunky multipart workaround rather than native.
-3.	No Built-In Service Discovery or Capability Negotiation
+
+**3.	No Built-In Service Discovery or Capability Negotiation**
 o	While MCP defines “capabilities” in the sense of metadata tags, there’s no canonical, dynamic registry for discovering which MCP servers are available on a network. In practice, users still need to hard-code endpoints or manage their own service directories.
-4.	Coarse-Grained Security Scoping
+
+**4.	Coarse-Grained Security Scoping**
 o	MCP’s OAuth-style tokens can gate access to broad categories (e.g., “read/write to this database”). But there’s no unified, fine-grained capability model (like capability URIs or object-capability tokens) that lets an LLM client prove it only wants “SELECT on table X” or “invoke function Y with arguments Z.”
-5.	Weak Multimodal & Event-Driven Patterns
+
+**5.	Weak Multimodal & Event-Driven Patterns**
 o	When the client needs to send mixed streams of text, image, and audio (e.g., a single MCP call that contains a short video clip plus a text prompt), implementers currently resort to base64‐encoded blobs inside JSON. MCP doesn’t define a first-class way to mark “this parameter is a live camera feed,” “this parameter is a chunked audio stream,” or “this parameter is a protobuf‐encoded point cloud.”
-6.	Single-Agent Focus
+
+**6.	Single-Agent Focus**
 o	MCP was explicitly crafted for “one LLM agent interacting with one data/tool server.” Higher-order patterns—where two MCP-enabled agents negotiate a task or piggyback on each other’s exposed contexts—require ad‐hoc bridging logic. (That becomes A2A territory.)
 ________________________________________
-2. Design Goals for “MCP 2.0” (a Next-Gen Protocol)
-1.	Low-Latency, Typed RPC
+**2. Design Goals for “MCP 2.0” (a Next-Gen Protocol)**
+
+**1.	Low-Latency, Typed RPC**
 o	Switch to a binary, schema-driven transport (e.g., Protocol Buffers over gRPC or Cap’n Proto) to reduce parsing overhead and guarantee end-to-end type safety.
 o	Define a minimal core schema for “ContextRequest,” “ContextResponse,” and “ToolInvocation” messages. Every field must be versioned explicitly.
-2.	Built-In Streaming & Multimodal Channels
+
+**2.	Built-In Streaming & Multimodal Channels**
 o	Embed first-class support for unary, server-stream, client-stream, and bi-directional stream methods—so an LLM can receive a 30 fps video feed or send a chunked audio stream without workaround.
 o	Standardize an envelope that carries “TextChunk,” “ImageFrame,” “AudioFrame,” and “BinaryBlob” under one gRPC service.
-3.	Dynamic Service Discovery & Capability Broadcasting
+
+**3.	Dynamic Service Discovery & Capability Broadcasting**
 o	Include a “Discovery” service in the core spec:
-	Register(serverName, capabilitiesList, ACLMetadata)
-	Lookup(requesterToken, capabilityFilter) → list<EndpointDescriptor>
+	-Register(serverName, capabilitiesList, ACLMetadata)
+	-Lookup(requesterToken, capabilityFilter) → list<EndpointDescriptor>
 o	Each server or agent advertises a well-known “Service Card” (much like A2A’s Agent Card but at the MCP layer) describing supported tool methods, data schemas, version constraints, and security requirements.
-4.	Fine-Grained, Capability-Based Security
+
+**4.	Fine-Grained, Capability-Based Security**
 o	Instead of “MCP ReadOnly” or “MCP ReadWrite” tokens, issue object-capability tokens that encode exactly which methods (and even which parameters) the client is allowed to call.
 o	Use something like macaroons or CAPBAC: each token carries verifiable metadata (scopes, expiration, allowed parameters), and servers can cryptographically check that inbound calls match the token’s mini-policy.
-5.	Pluggable Middleware for Observability, Caching, and Retries
+
+**5.	Pluggable Middleware for Observability, Caching, and Retries**
 o	Define hooks so that any MCP 2.0 client or server can inject:
-	Telemetry/Coverage Logging (e.g., “which client IP invoked which tool X at what time?”)
-	Distributed Caching Layers (clients can query a TTL cache proxy before going to the server, reducing latency for hot data).
-	Circuit Breakers & Retries (if a data source is down, the middleware can automatically retry or redirect to a read-only replica).
-6.	Native Support for Composite (Agent-to-Agent) Chaining
+	-Telemetry/Coverage Logging (e.g., “which client IP invoked which tool X at what time?”)
+	-Distributed Caching Layers (clients can query a TTL cache proxy before going to the server, reducing latency for hot data).
+	-Circuit Breakers & Retries (if a data source is down, the middleware can automatically retry or redirect to a read-only replica).
+
+**6.	Native Support for Composite (Agent-to-Agent) Chaining**
 o	Although MCP 2.0 remains fundamentally a “client ↔ server” protocol, it should include a chain-of-proxy mechanism that lets one agent appear as a server for the next agent. In practice, this means:
 1.	Agent A obtains a capability token from the enterprise registry.
 2.	Agent A passes a derived, restricted token to Agent B, along with a “proof of invocation” signature.
 3.	Agent B can then invoke Agent A’s “exposed embedding lookup” or “temporary cache” endpoints through the same protocol, with all calls bearer-token authenticated.
 o	By embedding a minimal “AgentDelegation” header field in every RPC, MCP 2.0 can support end-to-end traces across multiple agent hops.
-3. Concrete Feature Proposals
-3.1. Core Service Definition (gRPC + Protobuf)
+
+**3. Concrete Feature Proposals**
+**3.1. Core Service Definition (gRPC + Protobuf)**
 protobuf
  
 syntax = "proto3";
@@ -176,7 +189,7 @@ Rationale for This Core Definition
 •	Embedding multiple data shapes (text, image, audio, blob) in a single MultiModalFrame lets clients and servers seamlessly negotiate whether they want a text-only, image-only, or mixed exchange.
 •	Everything is Bearer Token + Object Capability; servers validate that the token they receive actually contains the minimal permissions to execute the requested operation on the requested resource.
 ________________________________________
-3.2. Fine-Grained Capability Tokens
+**3.2. Fine-Grained Capability Tokens**
 Instead of “I have an OAuth token that says I can call any /InvokeTool method,” we issue a capability token that encodes:
 •	Subject: the agent/LLM client ID (e.g., “agent12345”)
 •	Issuer: the corporate Identity Provider (IdP) or token service
@@ -191,7 +204,7 @@ A lightweight JSON Web Token (JWT) or Macaroon could carry these constraints in 
 3.	The requested method (e.g., InvokeTool(enhance_image)) matches Allowed Method(s) in the token.
 4.	If ContextRequest.context_key="inventory:prod123", ensure it matches "inventory:*" pattern from capability_token.
 ________________________________________
-3.3. Dynamic Service Discovery
+**3.3. Dynamic Service Discovery**
 Rather than requiring each agent to be manually configured with every MCP endpoint, we introduce a Discovery Registry. All MCP 2.0 servers (databases, caching layers, specialized tool chains) register themselves under:
 •	ServerName (unique string)
 •	List of Capabilities (e.g., ["db:inventory:read", "db:inventory:write"])
