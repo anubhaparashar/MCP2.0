@@ -1703,14 +1703,483 @@ o	Returns a ToolResponse containing a recommended_price (dummy).
 
 ________________________________________
 
+**9. EventBus Service (event_bus_server.py)**
+
+This service allows publishers to push events under a topic, and subscribers to receive them if their topic_filter matches. Create mcp2_project/event_bus_server.py:
+
+```
+
+# event_bus_server.py
+
+import threading
+import time
+from concurrent import futures
+import grpc
+
+import mcp2_pb2 as pb2
+import mcp2_pb2_grpc as pb2_grpc
+
+from auth import verify_capability_token, has_capability, has_audience
+from middleware import TelemetryLogger
+
+# ------------------------------------------------------------------
+# In‐Memory Pub/Sub Store
+# ------------------------------------------------------------------
+EVENT_SUBSCRIBERS = {}  # topic_filter -> list of subscriber callbacks
+SUB_LOCK = threading.Lock()
+TELEMETRY = TelemetryLogger()
+TOPIC_COUNTER = {}      # topic -> sequence counter
+
+def publish_event(topic: str, payload: bytes):
+    """
+    Called when a publisher pushes a new event. Distribute to any subscriber whose filter matches.
+    """
+    with SUB_LOCK:
+        for topic_filter, callbacks in EVENT_SUBSCRIBERS.items():
+            # Simple wildcard match: filter "inventory:*:low_stock" matches "inventory:prod_12345:low_stock"
+            if topic_filter.endswith("*"):
+                prefix = topic_filter[:-1]
+                if topic.startswith(prefix):
+                    for cb in callbacks:
+                        cb(topic, payload)
+            else:
+                if topic == topic_filter:
+                    for cb in callbacks:
+                        cb(topic, payload)
+
+class EventBusServicer(pb2_grpc.EventBusServicer):
+    def Publish(self, request, context):
+        """
+        Publisher pushes an event under request.topic with payload.
+        Requires capability "event:publish:<topic_pattern>"
+        """
+        start_time = time.time()
+        client_peer = context.peer()
+        try:
+            payload_jwt = verify_capability_token(request.publisher_token)
+            # Check capability: event:publish:<topic_filter> or wildcard
+            required = f"event:publish:{request.topic}"
+            if not has_capability(payload_jwt, required):
+                # Try wildcard checks
+                if not has_capability(payload_jwt, f"event:publish:{request.topic.split(':')[0]}*"):
+                    context.abort(grpc.StatusCode.PERMISSION_DENIED, f"Token lacks event:publish:{request.topic}")
+            if not has_audience(payload_jwt, "EventBusServer"):
+                context.abort(grpc.StatusCode.PERMISSION_DENIED, "Token not for EventBusServer")
+
+            # Assign a sequence number
+            seq = TOPIC_COUNTER.get(request.topic, 0) + 1
+            TOPIC_COUNTER[request.topic] = seq
+
+            # Publish to in-memory subscribers
+            publish_event(request.topic, request.payload)
+
+            TELEMETRY.log({
+                "method": "Publish",
+                "client": payload_jwt["sub"],
+                "topic": request.topic,
+                "latency_ms": int((time.time() - start_time) * 1000),
+                "status": "success"
+            })
+            return pb2.EventPublishResponse(success=True, message="Published")
+        except Exception as e:
+            TELEMETRY.log({
+                "method": "Publish",
+                "client": client_peer,
+                "latency_ms": int((time.time() - start_time) * 1000),
+                "status": f"failure: {e}"
+            })
+            context.abort(grpc.StatusCode.UNAUTHENTICATED, f"Publish failed: {e}")
+
+    def Subscribe(self, request, context):
+        """
+        Subscriber wants to receive all events matching request.topic_filter.
+        Requires capability "event:subscribe:<topic_filter>".
+        Streams back EventEnvelope messages as events come in.
+        """
+        start_time = time.time()
+        client_peer = context.peer()
+        try:
+            payload_jwt = verify_capability_token(request.subscriber_token)
+            required = f"event:subscribe:{request.topic_filter}"
+            if not has_capability(payload_jwt, required):
+                # Try wildcard
+                if not has_capability(payload_jwt, f"event:subscribe:{request.topic_filter.split(':')[0]}*"):
+                    context.abort(grpc.StatusCode.PERMISSION_DENIED, f"Token lacks event:subscribe:{request.topic_filter}")
+            if not has_audience(payload_jwt, "EventBusServer"):
+                context.abort(grpc.StatusCode.PERMISSION_DENIED, "Token not for EventBusServer")
+
+            # Register a callback that writes on the gRPC stream
+            def callback(topic: str, payload_bytes: bytes):
+                seq = TOPIC_COUNTER.get(topic, 0)
+                envelope = pb2.EventEnvelope(topic=topic, payload=payload_bytes, sequence_id=seq)
+                try:
+                    context.write(envelope)
+                except grpc.RpcError:
+                    pass  # client hung up
+
+            with SUB_LOCK:
+                EVENT_SUBSCRIBERS.setdefault(request.topic_filter, []).append(callback)
+
+            TELEMETRY.log({
+                "method": "Subscribe",
+                "client": payload_jwt["sub"],
+                "topic_filter": request.topic_filter,
+                "latency_ms": int((time.time() - start_time) * 1000),
+                "status": "subscribed"
+            })
+
+            # Keep the stream open until client cancels
+            while True:
+                if context.is_active():
+                    time.sleep(0.1)
+                    continue
+                else:
+                    break
+
+        except Exception as e:
+            TELEMETRY.log({
+                "method": "Subscribe",
+                "client": client_peer,
+                "latency_ms": int((time.time() - start_time) * 1000),
+                "status": f"failure: {e}"
+            })
+            context.abort(grpc.StatusCode.UNAUTHENTICATED, f"Subscribe failed: {e}")
+        finally:
+            # Cleanup subscribers matching this callback
+            with SUB_LOCK:
+                callbacks = EVENT_SUBSCRIBERS.get(request.topic_filter, [])
+                EVENT_SUBSCRIBERS[request.topic_filter] = [cb for cb in callbacks if cb != callback]
+
+# ------------------------------------------------------------------
+# Server Bootstrapping
+# ------------------------------------------------------------------
+def serve_event_bus():
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
+    pb2_grpc.add_EventBusServicer_to_server(EventBusServicer(), server)
+    listen_addr = '[::]:50052'
+    server.add_insecure_port(listen_addr)
+    print(f"[EventBus] Listening on {listen_addr}")
+    server.start()
+    server.wait_for_termination()
+
+if __name__ == "__main__":
+    serve_event_bus()
+
+
+```
+
+Key Points in event_bus_server.py:
+
+•	Publish
+
+o	Verifies that publisher_token includes a matching capability "event:publish:<topic>" or wildcard such as "event:publish:inventory:*".
+
+o	Assigns a monotonic sequence_id per topic.
+
+o	Dispatches the payload to all subscribers whose topic_filter matches (exact or wildcard).
+
+•	Subscribe
+
+o	Verifies that subscriber_token includes "event:subscribe:<topic_filter>" or wildcard.
+
+o	Registers a callback that pushes EventEnvelope(topic, payload, sequence_id) down the open stream.
+
+o	Keeps streaming until the client disconnects, then cleans up the subscriber.
+
+
+________________________________________
+
+**10. Example Client (client_example.py)**
+
+
+Below is an end‐to‐end example showing how an LLM agent might:
+
+1. Create capability tokens for itself.
+
+2. Register a new “InventoryDB_Primary” server with the registry.
+
+3. Look up that server by capability.
+
+4. Call RequestContext to fetch stock count.
+
+5. Subscribe to telemetry.
+
+6. Publish a low‐stock event via EventBus.
+
+7. Invoke a tool (compute_pricing) on the ContextTool server.
+
+Create mcp2_project/client_example.py:
+
+```
+
+# client_example.py
+
+import threading
+import time
+import grpc
+import json
+
+import mcp2_pb2 as pb2
+import mcp2_pb2_grpc as pb2_grpc
+
+from auth import create_capability_token, verify_capability_token
+from auth import has_capability, has_audience
+
+# ------------------------------------------------------------------
+# Configuration: Addresses
+# ------------------------------------------------------------------
+REGISTRY_ADDR = "localhost:50050"
+CONTEXTOOL_ADDR = "localhost:50051"
+EVENTBUS_ADDR = "localhost:50052"
+
+# ------------------------------------------------------------------
+# 1. Create Capability Tokens
+# ------------------------------------------------------------------
+# 1a. For Registry Registration (server side):
+inventory_server_registration_token = create_capability_token(
+    subject="InventoryDB_Primary",
+    capabilities=["registry:register"],
+    audience=["RegistryServer"]
+)
+
+# 1b. For Registry Lookup (agent side):
+agent_lookup_token = create_capability_token(
+    subject="AgentA",
+    capabilities=["registry:lookup"],
+    audience=["InventoryDB_*", "EventBusServer", "ContextToolServer"]
+)
+
+# 1c. For ContextTool usage:
+agent_context_token = create_capability_token(
+    subject="AgentA",
+    capabilities=["db:inventory:read", "telemetry:read", "tool:compute_pricing", "tool:multimodal_exchange"],
+    audience=["InventoryDB_*"]
+)
+
+# 1d. For EventBus usage:
+agent_event_sub_token = create_capability_token(
+    subject="AgentA",
+    capabilities=["event:subscribe:inventory:*", "event:publish:inventory:*"],
+    audience=["EventBusServer"]
+)
+
+# 1e. For InventoryDB to publish telemetry:
+inventory_telemetry_token = create_capability_token(
+    subject="InventoryDB_Primary",
+    capabilities=["telemetry:publish"],  # Note: the server itself usually doesn't need a token, but included for symmetry
+    audience=["ContextToolServer"]
+)
+
+# ------------------------------------------------------------------
+# 2. Register InventoryDB_Primary with Registry
+# ------------------------------------------------------------------
+def register_inventorydb():
+    channel = grpc.insecure_channel(REGISTRY_ADDR)
+    stub = pb2_grpc.DiscoveryStub(channel)
+
+    metadata = [("grpc-url", CONTEXTOOL_ADDR)]
+    req = pb2.RegisterRequest(
+        server_name="InventoryDB_Primary",
+        capabilities=["db:inventory:read", "telemetry:read", "tool:compute_pricing", "tool:multimodal_exchange"]
+    )
+    resp = stub.Register(req, metadata=metadata, timeout=5, credentials=None,
+                        compression=None, wait_for_ready=None,
+                        metadata_callback=None, credentials_callback=None,
+                        additional_metadata=[("registration_token", inventory_server_registration_token)])
+    print(f"[Client] Register InventoryDB: {resp.success} | {resp.message}")
+
+# ------------------------------------------------------------------
+# 3. Lookup InventoryDB Endpoint
+# ------------------------------------------------------------------
+def lookup_inventorydb():
+    channel = grpc.insecure_channel(REGISTRY_ADDR)
+    stub = pb2_grpc.DiscoveryStub(channel)
+    req = pb2.LookupRequest(
+        requester_token=agent_lookup_token,
+        capability_filter=["db:inventory:read"]
+    )
+    resp = stub.Lookup(req, timeout=5)
+    print("[Client] Lookup Results:")
+    for ep in resp.endpoints:
+        print(f"  -> {ep.server_name} @ {ep.grpc_url} (caps={ep.capabilities})")
+    return resp.endpoints
+
+# ------------------------------------------------------------------
+# 4. Call RequestContext
+# ------------------------------------------------------------------
+def fetch_stock_count(grpc_url: str):
+    channel = grpc.insecure_channel(grpc_url)
+    stub = pb2_grpc.ContextToolStub(channel)
+
+    req = pb2.ContextRequest(
+        context_key="inventory:prod_12345:stock_count",
+        parameters={"warehouse": "NY", "min_qty": "1"},
+        capability_token=agent_context_token
+    )
+    resp = stub.RequestContext(req, timeout=5)
+    stock = resp.serialized_value.decode("utf-8")
+    print(f"[Client] Stock count for prod_12345: {stock} | metadata={resp.metadata}")
+
+# ------------------------------------------------------------------
+# 5. Subscribe to Telemetry (background thread)
+# ------------------------------------------------------------------
+def subscribe_telemetry(grpc_url: str):
+    def run():
+        channel = grpc.insecure_channel(grpc_url)
+        stub = pb2_grpc.ContextToolStub(channel)
+        req = pb2.TelemetryRequest(
+            stream_id="fleet123:engine_temp",
+            capability_token=agent_context_token
+        )
+        try:
+            for frame in stub.SubscribeTelemetry(req, timeout=None):
+                payload = frame.payload.decode("utf-8")
+                print(f"[Telemetry] ts={frame.timestamp_ms} | payload={payload}")
+        except grpc.RpcError as e:
+            print(f"[Telemetry] Stream closed: {e}")
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    return thread
+
+# ------------------------------------------------------------------
+# 6. Publish a Low‐Stock Event
+# ------------------------------------------------------------------
+def publish_low_stock(grpc_url: str):
+    channel = grpc.insecure_channel(grpc_url)
+    stub = pb2_grpc.EventBusStub(channel)
+
+    topic = "inventory:prod_12345:low_stock"
+    payload = json.dumps({"current_stock": 9}).encode("utf-8")
+
+    req = pb2.EventPublishRequest(
+        topic=topic,
+        payload=payload,
+        publisher_token=agent_event_sub_token  # agent is authorized to publish
+    )
+    resp = stub.Publish(req, timeout=5)
+    print(f"[Client] Published low-stock event: {resp.success} | {resp.message}")
+
+# ------------------------------------------------------------------
+# 7. Invoke compute_pricing Tool
+# ------------------------------------------------------------------
+def invoke_compute_pricing(grpc_url: str):
+    channel = grpc.insecure_channel(grpc_url)
+    stub = pb2_grpc.ContextToolStub(channel)
+
+    req = pb2.ToolRequest(
+        tool_name="compute_pricing",
+        arguments={"sku": "prod_12345", "stock_count": "42"},
+        capability_token=agent_context_token
+    )
+    resp = stub.InvokeTool(req, timeout=5)
+    recommended = resp.outputs.get("recommended_price", b"0.0").decode("utf-8")
+    print(f"[Client] compute_pricing -> recommended_price: {recommended} | warnings={resp.warnings}")
+
+# ------------------------------------------------------------------
+# 8. Main Flow
+# ------------------------------------------------------------------
+if __name__ == "__main__":
+    # 2. Register InventoryDB_Primary
+    register_inventorydb()
+
+    # 3. Lookup InventoryDB
+    endpoints = lookup_inventorydb()
+    inventory_ep = endpoints[0].grpc_url if endpoints else None
+
+    if not inventory_ep:
+        print("[Error] No InventoryDB endpoint found.")
+        exit(1)
+
+    # 4. Fetch stock count
+    fetch_stock_count(inventory_ep)
+
+    # 5. Subscribe to telemetry
+    tel_thread = subscribe_telemetry(inventory_ep)
+
+    # Wait a few seconds to collect telemetry
+    time.sleep(12)
+
+    # 6. Publish a low-stock event via EventBus
+    publish_low_stock(EVENTBUS_ADDR)
+
+    # 7. Invoke compute_pricing
+    invoke_compute_pricing(inventory_ep)
+
+    # Keep main thread alive to see more telemetry
+    time.sleep(5)
+    print("[Client] Done.")
+
+```
+
+
+How client_example.py Works:
+
+1. Token Creation
+
+o Five tokens are created:
+
+ inventory_server_registration_token with "registry:register" so the InventoryDB server can register itself.
+
+ agent_lookup_token with "registry:lookup".
+
+ agent_context_token with "db:inventory:read", "telemetry:read", "tool:compute_pricing", "tool:multimodal_exchange".
+
+ agent_event_sub_token with "event:subscribe:inventory:" and "event:publish:inventory:".
+
+ inventory_telemetry_token for the server’s own telemetry publishing (not used in this example).
+
+2. Register InventoryDB
+
+o Calls Discovery.Register(...) on REGISTRY_ADDR with metadata ("grpc-url", CONTEXTOOL_ADDR) and registration_token=inventory_server_registration_token.
+
+o The registry stores ("InventoryDB_Primary" → {grpc_url="localhost:50051", caps=[...]}).
+
+3. Lookup InventoryDB
+
+o Calls Discovery.Lookup(...) with capability_filter=["db:inventory:read"].
+
+o Prints out the returned endpoints (should include InventoryDB_Primary).
+
+4. RequestContext
+
+o Calls RequestContext on inventory_ep (the ContextTool server). Returns the stock count “42” from the in‐memory CONTEXT_DATA.
+
+5. SubscribeTelemetry
+
+o Runs a background thread that calls SubscribeTelemetry(stream_id="fleet123:engine_temp").
+
+o Meanwhile, the context_tool_server.py is already running a background telemetry_pusher that pushes a JSON payload every 5 seconds. The client thread prints them as they arrive.
+
+6. Publish Low‐Stock Event
+
+o Calls EventBus.Publish(topic="inventory:prod_12345:low_stock", payload={"current_stock":9}).
+
+o Verifies the publishing capability, then broadcasts to any subscribers (none in this example except if another client were listening).
+
+7. InvokeTool
+
+o Calls InvokeTool(tool_name="compute_pricing", arguments={"sku":"prod_12345","stock_count":"42"}).
+
+o Receives recommended_price from the dummy logic in context_tool_server.py.
+
+
+
+
 
 
 
 
 ________________________________________
+
+
 ________________________________________
+
+
 ________________________________________
-________________________________________
+
+
+
 ________________________________________
 
 
