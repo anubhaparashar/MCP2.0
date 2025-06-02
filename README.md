@@ -2281,20 +2281,8 @@ Expected output (timestamps/content will vary slightly):
 
 ```
 
-[Client] Register InventoryDB: True | Registered successfully
-[Client] Lookup Results:
-  -> InventoryDB_Primary @ localhost:50051 (caps=['db:inventory:read', 'telemetry:read', 'tool:compute_pricing', 'tool:multimodal_exchange'])
-[Client] Stock count for prod_12345: 42 | metadata=['timestamp:2025-06-01T08:00:00Z']
-[Telemetry] ts=1700000000000 | payload={"engine_temp": 73}
-[Telemetry] ts=1700000005000 | payload={"engine_temp": 74}
-[Telemetry] ts=1700000010000 | payload={"engine_temp": 75}
-[Client] Published low-stock event: True | Published
-[Client] compute_pricing -> recommended_price: 95.8 | warnings=[]
-[Telemetry] ts=1700000015000 | payload={"engine_temp": 76}
-[Client] Done.
 
 
-```
 
 •  Notice the client printed three telemetry messages (once every 5 seconds).
 
@@ -2349,6 +2337,66 @@ o	Apply caching
 
 •	For example:
 
+
+```
+
+def rpc_handler(func):
+    @functools.wraps(func)
+    def wrapper(self, request, context):
+        start = time.time()
+        try:
+            payload = verify_capability_token(request.capability_token)
+            # Additional capability checks...
+            result = func(self, request, context, payload)
+            TELEMETRY.log({...})
+            return result
+        except Exception as e:
+            TELEMETRY.log({...})
+            context.abort(...)
+    return wrapper
+
+```
+
+7.  Agent Delegation Proofs
+
+•	We included an agent_delegation_proof field but did not exercise it in this demo. In production:
+
+1.	When Agent A wants Agent B to act on its behalf, it signs a new JWT (the delegation proof) encoding:
+   
+	issuer: Agent A
+
+	delegatee: Agent B
+
+	delegated capabilities
+
+	validity window
+
+2.	Agent B’s server calls verify_capability_token(delegation_proof), checks that:
+   
+	sub (issuer) matches Agent A’s known ID
+
+	delegatee matches “my” server name (Agent B)
+
+	The delegated capabilities are a subset of what Agent A originally held
+
+3.	Then Agent B can amplify its own JWT with those delegated rights when calling tools or other MCP servers.
+
+
+
+
+
+8. Monitoring & Metrics
+
+• Replace print‐based logging in TelemetryLogger with structured logs (JSON) sent to ELK, Datadog, or OpenTelemetry.
+
+• Instrument application metrics (QPS, error rates, latencies) and expose a /metrics Prometheus endpoint.
+
+
+9. Language Ecosystem
+
+• Although this demo is in Python, the same mcp2.proto can generate Go, Java, C#, or Node JS stubs via protoc.
+
+• Each service (Registry, ContextTool, EventBus) can be implemented in any language, as long as it speaks the same protobuf schema.
 
 
 ________________________________________
