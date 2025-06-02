@@ -1,8 +1,6 @@
 # MCP2.0
 
 ```
-
-
 mcp2_project/
 ├─ protos/
 │   └─ mcp2.proto
@@ -16,9 +14,6 @@ mcp2_project/
 │
 ├─ client_example.py
 └─ requirements.txt
-
-
-
 ```
 
 
