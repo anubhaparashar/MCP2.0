@@ -2172,8 +2172,183 @@ o Receives recommended_price from the dummy logic in context_tool_server.py.
 
 ________________________________________
 
+**11. How to Run & Test**
+
+
+****1. Install dependencies (from project root):**
+**
+```
+
+source venv/bin/activate      # if not already active
+pip install -r requirements.txt
+
+
+```
+
+2. Generate gRPC code (only once, or if you update mcp2.proto):
+
+```
+
+python -m grpc_tools.protoc \
+    --proto_path=protos \
+    --python_out=. \
+    --grpc_python_out=. \
+    protos/mcp2.proto
+
+```
+
+Start the Registry Server (in its own terminal):
+
+```
+
+cd mcp2_project
+python registry_server.py
+
+
+```
+
+You should see:
+
+```
+
+[Registry] Listening on [::]:50050
+
+```
+
+
+4. Start the ContextTool Server (in another terminal):
+
+```
+
+cd mcp2_project
+python context_tool_server.py
+
+```
+
+You should see:
+
+```
+
+[ContextTool] Listening on [::]:50051
+
+```
+
+And every 5 seconds, the telemetry pusher logs nothing client‐side until someone subscribes, but you know it’s running.
+
+5. Start the EventBus Server (in yet another terminal):
+
+```
+
+cd mcp2_project
+python event_bus_server.py
+
+
+```
+
+You should see:
+
+```
+
+[EventBus] Listening on [::]:50052
+
+
+```
+6. Run the Client Example (in a fourth terminal):
+
+```
+
+cd mcp2_project
+python client_example.py
+
+```
+
+Expected output (timestamps/content will vary slightly):
+
+```
+
+[Client] Register InventoryDB: True | Registered successfully
+[Client] Lookup Results:
+  -> InventoryDB_Primary @ localhost:50051 (caps=['db:inventory:read', 'telemetry:read', 'tool:compute_pricing', 'tool:multimodal_exchange'])
+[Client] Stock count for prod_12345: 42 | metadata=['timestamp:2025-06-01T08:00:00Z']
+[Telemetry] ts=1700000000000 | payload={"engine_temp": 73}
+[Telemetry] ts=1700000005000 | payload={"engine_temp": 74}
+[Telemetry] ts=1700000010000 | payload={"engine_temp": 75}
+[Client] Published low-stock event: True | Published
+[Client] compute_pricing -> recommended_price: 95.8 | warnings=[]
+[Telemetry] ts=1700000015000 | payload={"engine_temp": 76}
+[Client] Done.
+
+
+```
+
+[Client] Register InventoryDB: True | Registered successfully
+[Client] Lookup Results:
+  -> InventoryDB_Primary @ localhost:50051 (caps=['db:inventory:read', 'telemetry:read', 'tool:compute_pricing', 'tool:multimodal_exchange'])
+[Client] Stock count for prod_12345: 42 | metadata=['timestamp:2025-06-01T08:00:00Z']
+[Telemetry] ts=1700000000000 | payload={"engine_temp": 73}
+[Telemetry] ts=1700000005000 | payload={"engine_temp": 74}
+[Telemetry] ts=1700000010000 | payload={"engine_temp": 75}
+[Client] Published low-stock event: True | Published
+[Client] compute_pricing -> recommended_price: 95.8 | warnings=[]
+[Telemetry] ts=1700000015000 | payload={"engine_temp": 76}
+[Client] Done.
+
+
+```
+
+•  Notice the client printed three telemetry messages (once every 5 seconds).
+
+•  Then it published a low‐stock event. (No subscriber was listening on EventBus in this script, so no one printed it.)
+
+•  Finally, it invoked compute_pricing and printed the dummy price.
+
+
+
 
 ________________________________________
+
+**12. Extending & Production Considerations**
+
+1.   Persistent Registry
+
+•	Swap the in‐memory RegistryStore for etcd, Consul, or a relational database. Ensure high availability and leader election.
+
+2.  TLS / mTLS
+
+•	Replace server.add_insecure_port(...) with server.add_secure_port(...) using server certificates.
+
+•	Use gRPC’s SSL credentials on both client and server sides.
+
+3.  Asymmetric JWTs or Macaroons
+
+•	Instead of HS256, use RS256 with a private key at the IdP and public keys at each server for verification.
+
+•	Alternatively, use macaroons for fine-grained caveats and payments.
+
+4.  Scalable Pub/Sub
+
+•	Replace the in‐memory EVENT_SUBSCRIBERS map with Redis Streams, Kafka, or Google Pub/Sub for persistence and horizontal scaling.
+
+5.  Real Data Sources
+
+•	In ContextTool.RequestContext, replace CONTEXT_DATA with real database calls (Postgres, Mongo, etc.).
+
+•	Add SQL injection protection, connection pooling, and transactional logic.
+
+6.  Middleware Integration
+
+•	Wrap each RPC handler with decorators that:
+
+o	Validate tokens
+
+o	Log telemetry
+
+o	Check circuit breaker
+
+o	Apply caching
+
+•	For example:
+
 
 
 ________________________________________
