@@ -11,6 +11,7 @@ o	Because JSON is untyped, both client and server need to agree on schemas out�
 o	Most MCP servers/clients treat each request/response as self‐contained. Streaming large datasets (e.g., hundreds of megabytes of logs, long audio transcripts, or real-time telemetry) often becomes a clunky multipart workaround rather than native.
 
 **3.	No Built-In Service Discovery or Capability Negotiation**
+
 o	While MCP defines “capabilities” in the sense of metadata tags, there’s no canonical, dynamic registry for discovering which MCP servers are available on a network. In practice, users still need to hard-code endpoints or manage their own service directories.
 
 **4.	Coarse-Grained Security Scoping**
