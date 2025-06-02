@@ -374,23 +374,24 @@ ToolResponse({
 })
 o	Agent A synthesizes the final answer for the end user.
 ________________________________________
-5. Why This Is “Better” Than MCP 1.0
-1.	End-to-End Typing & Versioning
+**5. Why This Is “Better” Than MCP 1.0**
+
+**1.	End-to-End Typing & Versioning**
 o	No more “field not found” or silent JSON errors. Every message is governed by a protobuf definition. New fields are safely ignored by older clients.
-2.	Zero-Boilerplate Streaming
+**2.	Zero-Boilerplate Streaming**
 o	gRPC’s native streams allow true low-latency, chunked transfers of video/audio/text without hacks (e.g., worrying about base64-over-JSON size bloat).
-3.	Unified Discovery & Capability Model
+**3.	Unified Discovery & Capability Model**
 o	Because every MCP 2.0 server registers its Service Card, agents don’t need manual endpoint configuration. They simply ask “Which endpoints speak db:inventory:read right now?”
 o	The registry enforces ACL checks at lookup time, preventing unauthorized enumeration.
-4.	Fine-Grained Security
+**4.	Fine-Grained Security**
 o	Object-capability tokens ensure that if an agent is compromised, the blast radius is constrained to exactly the minimal methods/parameters it should see.
 o	No more “all-or-nothing” OAuth scopes that often require backend guards or custom validation code.
-5.	First-Class Eventing
+**5.	First-Class Eventing**
 o	Publish/sub-scribe semantics let agents “listen” for state changes (e.g., stock < 10) rather than polling at intervals. That reduces load on the servers and improves responsiveness.
-6.	Built-In Agent Delegation
+**6.	Built-In Agent Delegation**
 o	MCP 1.0 had no explicit concept of “here’s a token I can pass you so you can act on my behalf.” In MCP 2.0, delegation is baked into the protocol via the agent_delegation_proof field.
 o	That makes multi-agent pipelines more transparent and auditable.
-7.	Pluggable Observability & Caching Middlewares
+**7.	Pluggable Observability & Caching Middlewares**
 o	By factoring out telemetry, caching, and circuit breaking into swappable middleware components, implementers can “drop in” NFAs (non-functional assurances) without rewriting core logic.
 o	This reduces boilerplate across every new MCP-capable server or client.
 ________________________________________
