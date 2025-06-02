@@ -394,17 +394,22 @@ o	That makes multi-agent pipelines more transparent and auditable.
 o	By factoring out telemetry, caching, and circuit breaking into swappable middleware components, implementers can “drop in” NFAs (non-functional assurances) without rewriting core logic.
 o	This reduces boilerplate across every new MCP-capable server or client.
 ________________________________________
-6. Potential Drawbacks & Trade-Offs
-1.	Increased Complexity & Setup Overhead
+**6. Potential Drawbacks & Trade-Offs**
+   
+**1.	Increased Complexity & Setup Overhead**
+   
 o	Moving from plain JSON-RPC to gRPC/Protobuf requires a schema registry, code generation, and deeper build setup in each language.
 o	Teams that only need a “quick hack” may find MCP 1.0’s minimal JSON approach more approachable.
-2.	Operational Burden for the Registry
+
+**2.	Operational Burden for the Registry**
 o	Running a distributed service registry (etcd/Consul) is another moving part. If the registry goes down, new agents can’t discover endpoints.
 o	High-availability (HA) setups mitigate that, but at extra cost.
-3.	Learning Curve for Object-Capabilities
+
+**3.	Learning Curve for Object-Capabilities**
 o	Teams unfamiliar with capability-based security (macaroons, for example) will need to invest in training.
 o	However, that payoff is strong for large enterprises that genuinely need least-privilege delegation.
-4.	Version Skews in Mixed Deployments
+
+**4.	Version Skews in Mixed Deployments**
 o	Until every MCP participant upgrades, you might have a hybrid environment where some servers speak MCP 1.0 and others speak MCP 2.0.
 o	Designing a seamless fallback layer (e.g., a JSON-RPC→gRPC shim) is possible but requires work.
 
