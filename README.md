@@ -578,3 +578,137 @@ o	However, that payoff is strong for large enterprises that genuinely need least
 o	Until every MCP participant upgrades, you might have a hybrid environment where some servers speak MCP 1.0 and others speak MCP 2.0.
 o	Designing a seamless fallback layer (e.g., a JSON-RPC→gRPC shim) is possible but requires work.
 
+
+________________________________________
+
+
+**Below is a complete, reference Python implementation of “MCP 2.0” as sketched earlier. It includes:**
+
+1. Overview & Project Layout
+
+2. Protobuf Definitions (mcp2.proto)
+
+3. Code Generation Instructions
+
+4. Authentication Module (auth.py)
+
+5. Middleware Stubs (middleware.py)
+
+6. Registry Service (registry_server.py)
+
+7. ContextTool Service (context_tool_server.py)
+
+8. EventBus Service (event_bus_server.py)
+
+9. Example Client (client_example.py)
+
+10. How to Run & Test
+
+All code is written in Python 3.8+ and uses gRPC + Protocol Buffers. Feel free to adapt or extend for production (e.g., swap the in‐memory stores for Redis/etcd, add real business logic, enable TLS, etc.).
+
+________________________________________
+
+**1. Overview & Project Layout**
+
+```
+
+mcp2_project/
+├─ protos/
+│   └─ mcp2.proto
+│
+├─ auth.py
+├─ middleware.py
+│
+├─ registry_server.py
+├─ context_tool_server.py
+├─ event_bus_server.py
+│
+├─ client_example.py
+└─ requirements.txt
+
+```
+1. protos/mcp2.proto
+  
+Defines all gRPC services and messages for MCP 2.0 (Discovery, ContextTool, EventBus).
+
+2. auth.py
+
+Lightweight capability‐token creation & verification using PyJWT.
+
+3. middleware.py
+  
+Stubs for telemetry logging, caching, and circuit breakers (demonstrative).
+
+4. registry\_server.py
+   
+Implements the Discovery service: register servers/agents + lookup endpoints by capability.
+
+5. context\_tool\_server.py
+
+Implements ContextTool: RequestContext (unary), SubscribeTelemetry (server‐stream), MultiModalExchange (bidi‐stream), InvokeTool (unary).
+
+6. event\_bus\_server.py
+   
+Implements EventBus: Publish events + Subscribe (server‐stream).
+
+7. client\_example.py
+  
+Shows how an LLM agent might:
+
+   * Obtain capability tokens
+   * Register itself with the registry
+   * Look up servers by capability
+   * Call RequestContext, Subscribe, Publish, InvokeTool, etc.
+
+8. requirements.txt
+
+Lists all Python dependencies.
+
+________________________________________
+
+
+
+________________________________________
+
+
+
+
+________________________________________
+
+
+
+
+
+________________________________________
+
+
+
+
+
+________________________________________
+
+________________________________________
+
+________________________________________
+________________________________________
+________________________________________
+________________________________________
+________________________________________
+________________________________________
+________________________________________
+
+
+
+________________________________________
+
+________________________________________
+
+________________________________________
+________________________________________
+________________________________________
+________________________________________
+________________________________________
+________________________________________
+________________________________________
+
+
