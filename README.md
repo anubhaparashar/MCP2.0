@@ -66,10 +66,15 @@ o	Define hooks so that any MCP 2.0 client or server can inject:
 	 o Circuit Breakers & Retries (if a data source is down, the middleware can automatically retry or redirect to a read-only replica).
 
 **6.	Native Support for Composite (Agent-to-Agent) Chaining**
+
 o	Although MCP 2.0 remains fundamentally a “client ↔ server” protocol, it should include a chain-of-proxy mechanism that lets one agent appear as a server for the next agent. In practice, this means:
+
 1.	Agent A obtains a capability token from the enterprise registry.
+   
 2.	Agent A passes a derived, restricted token to Agent B, along with a “proof of invocation” signature.
+
 3.	Agent B can then invoke Agent A’s “exposed embedding lookup” or “temporary cache” endpoints through the same protocol, with all calls bearer-token authenticated.
+   
 o	By embedding a minimal “AgentDelegation” header field in every RPC, MCP 2.0 can support end-to-end traces across multiple agent hops.
 
 **3. Concrete Feature Proposals**
@@ -203,48 +208,87 @@ message ToolResponse {
   map<string, bytes> outputs = 2;     // e.g., {"enhanced_image_jpeg": <...>}
   repeated string warnings = 3;
 }
-Rationale for This Core Definition
+
+```
+
+**Rationale for This Core Definition**
+
 •	Protocol Buffers guarantee that every field is typed and versioned. If you later add int64 criticality_score = 5; to ToolRequest, old clients simply ignore it and new clients can read it—no silent runtime errors.
+
 •	gRPC (over HTTP/2) provides built-in support for all four RPC modes (unary, server-stream, client-stream, bidi-stream) without extra plumbing.
+
 •	Embedding multiple data shapes (text, image, audio, blob) in a single MultiModalFrame lets clients and servers seamlessly negotiate whether they want a text-only, image-only, or mixed exchange.
+
 •	Everything is Bearer Token + Object Capability; servers validate that the token they receive actually contains the minimal permissions to execute the requested operation on the requested resource.
 ________________________________________
+
 **3.2. Fine-Grained Capability Tokens**
+
 Instead of “I have an OAuth token that says I can call any /InvokeTool method,” we issue a capability token that encodes:
+
 •	Subject: the agent/LLM client ID (e.g., “agent12345”)
+
 •	Issuer: the corporate Identity Provider (IdP) or token service
+
 •	Allowed Method(s): one or more of
+
 o	ContextTool.RequestContext(context_keyPattern="inventory:*", allowedParams=[“filter”])
+
 o	ContextTool.InvokeTool(tool_name="encrypt_data", allowedParams=[“plaintext”])
+
 •	Validity Window: issuance timestamp + TTL (e.g., expires_at=2025-06-15T00:00:00Z)
+
 •	Audience: which MCP 2.0 server(s) can accept this token (e.g., aud=["inventoryDBServer"])
+
 A lightweight JSON Web Token (JWT) or Macaroon could carry these constraints in its claims. At call time, the server verifies:
+
 1.	Token signature (to ensure it wasn’t forged)
+   
 2.	now <= expires_at
+   
 3.	The requested method (e.g., InvokeTool(enhance_image)) matches Allowed Method(s) in the token.
+   
 4.	If ContextRequest.context_key="inventory:prod123", ensure it matches "inventory:*" pattern from capability_token.
+   
 ________________________________________
+
 **3.3. Dynamic Service Discovery**
+
 Rather than requiring each agent to be manually configured with every MCP endpoint, we introduce a Discovery Registry. All MCP 2.0 servers (databases, caching layers, specialized tool chains) register themselves under:
+
 •	ServerName (unique string)
+
 •	List of Capabilities (e.g., ["db:inventory:read", "db:inventory:write"])
+
 •	Optional Tags (e.g., region="us-east-1", latency≈10ms)
+
 A simplified workflow:
+
 1.	Server S boots up, obtains a registration token from the IdP, and calls Discovery.Register({server_name:"S", capabilities:[…], registration_token:T}).
+   
 2.	Registry records this in a distributed key–value store (e.g., etcd or Consul).
+   
 3.	Agent A wants to query the inventory. It already holds a capability token for "db:inventory:read". It calls Discovery.Lookup({requester_token:T_A, capability_filter:["db:inventory:read"]}).
+   
 4.	Registry returns a list like
+
+   ```
 jsonc
  
 [
   { "server_name": "InventoryDB_Replica1", "grpc_url": "10.0.2.45:55051", "capabilities":["db:inventory:read"] },
   { "server_name": "InventoryDB_Primary",  "grpc_url": "10.0.2.33:55051", "capabilities":["db:inventory:read","db:inventory:write"] }
 ]
+```
+
 5.	Agent A picks the lowest-latency endpoint (Replica1) and talks to it directly via ContextTool.RequestContext({...}), presenting its same capability token.
 Because the registry itself enforces that the token holder has can_lookup="db:inventory:read", unauthorized clients never get a list of endpoints.
 ________________________________________
-3.4. Native Event‐Driven (Publish/Subscribe)
+
+**3.4. Native Event‐Driven (Publish/Subscribe)**
+
 Beyond unary RPCs, many use cases require eventing (e.g., “notify me when stock of product X drops below 10”). MCP 2.0 can layer on a minimal pub/sub feature:
+```
 protobuf
  
 service EventBus {
@@ -276,15 +320,27 @@ message EventEnvelope {
   bytes payload = 2;
   int64 sequence_id = 3;
 }
+```
+
 •	This pub/sub layer can run on the same gRPC server, or be a sidecar.
+
 •	All pub/sub messages are authenticated via tokens scoped to the exact topic patterns.
+
 •	LLM agents can say, “Stream me inventory:prod123:low_stock events,” and the server would push each matching EventEnvelope down a bidi stream.
+
 ________________________________________
-4. Illustrative End-to-End Flow
+
+**4. Illustrative End-to-End Flow**
+
 Below is a step-by-step scenario showing how MCP 2.0 might look in practice:
-1.	Setup
+
+**1.	Setup**
+   
 o	An enterprise runs an MCP 2.0 Registry Service at registry.company.local:55050.
+
 o	A specialized “InventoryDB” server is coded against the mcp2.ContextTool and mcp2.EventBus services. It starts up, presents its IAM credential to the registry, and calls:
+
+```
 text
  
 Discovery.Register({
@@ -292,10 +348,18 @@ Discovery.Register({
   capabilities: ["db:inventory:read","db:inventory:write","event:publish:inventory:*"],
   registration_token: <signed_by_Enterprise_IdP>
 })
+
+```
+
 o	The registry writes this into the cluster store.
+
 o	Later, a second node “InventoryDB_Replica1” registers similarly with only db:inventory:read.
-2.	Agent Initialization
+
+**2.	Agent Initialization**
+
 o	Agent A (an LLM agent running in Azure Function) fetches a scoped capability token from the corporate IdP:
+
+```
 json
  
 {
@@ -305,16 +369,27 @@ json
   "capabilities": ["db:inventory:read","event:subscribe:inventory:*"],
   "exp":"2025-07-01T00:00:00Z"
 }
+```
+
 o	Agent A also fetches a second token for image processing from “ImageEnhancer” (another MCP 2.0 server).
-3.	Service Discovery & Context Request
+
+**3.	Service Discovery & Context Request**
+
 o	Agent A calls:
+
+```
 text
  
 Discovery.Lookup({
   requester_token: <agentA_token>,
   capability_filter: ["db:inventory:read"]
 })
+
+```
+
 o	Registry responds with:
+
+```
 json
  
 [
@@ -329,8 +404,14 @@ json
     "capabilities": ["db:inventory:read","db:inventory:write"]
   }
 ]
+
+```
+
+
 o	Agent A picks InventoryDB_Replica1.
 o	Agent A calls:
+
+```
 text
  
 ContextTool.RequestContext({
@@ -338,16 +419,24 @@ ContextTool.RequestContext({
   parameters: { "filter": "warehouse='NY', qty>0" },
   capability_token: <agentA_token>
 })
+```
+
 o	Replica1 validates that agentA_token indeed allows ContextRequest(context_key="inventory:*"). It returns a protobuf‐encoded response with {stock_count: 42}, plus a metadata tag ["timestamp:2025-06-01T08:00:00Z"].
-4.	Subscribe to Low-Stock Events
+
+**4.	Subscribe to Low-Stock Events**
+
 o	Agent A wants to be notified whenever prod_12345’s stock dips below 10. It calls:
+```
 text
  
 EventBus.Subscribe({
   topic_filter: "inventory:prod_12345:low_stock",
   subscriber_token: <agentA_token>
 })
+```
+
 o	The stream remains open. As soon as stock falls below 10 (inside InventoryDB), that server issues:
+```
 text
  
 EventBus.Publish({
@@ -355,27 +444,50 @@ EventBus.Publish({
   payload: <encoded {current_stock:9, timestamp:…}>,
   publisher_token: <inventorydb_token>
 })
+```
+
 o	Agent A’s subscription stream yields an EventEnvelope with topic="inventory:prod_12345:low_stock" and payload.
-5.	Delegating a Tool Invocation to an Image Server
+
+**5.	Delegating a Tool Invocation to an Image Server**
+   
 o	User’s chat prompt: “Here is an image from the warehouse camera. Enhance the text overlay so I can read the date stamp.”
+
 o	Agent A has already discovered and fetched a token for ImageEnhancer. It calls:
+
+```
 text
  
 Discovery.Lookup({
   requester_token: <agentA_image_token>,
   capability_filter: ["tool:enhance_image"]
 })
+
+```
+
+
 o	Registry returns the endpoint(s) for “ImageEnhancerServer.”
+
 o	Agent A then streams the raw JPEG frames via ContextTool.MultiModalExchange:
+
+```
 yaml
  
 [ MultiModalFrame { data: ImageFrame { jpeg_data: <chunk1>, sequence:1 } },
   MultiModalFrame { data: ImageFrame { jpeg_data: <chunk2>, sequence:2 } } ]
+
+```
+
 o	ImageEnhancerServer returns a bidi stream of enhanced frames.
+
 o	Agent A reassembles them and embeds the enhanced image back into its chat response.
-6.	Agent-to-Agent Chaining
+
+**6.	Agent-to-Agent Chaining**
+
 o	Suppose Agent A realizes it needs “business logic” on top of the raw stock count—something only Agent B (the “PricingRulesAgent”) knows how to compute.
+
 o	Agent A has previously fetched a delegation token from the registry that allows delegating a subset of its capabilities to Agent B. It constructs:
+
+```
 text
  
 agent_delegation_proof = sign(
@@ -388,8 +500,12 @@ agent_delegation_proof = sign(
   },
   delegator_private_key
 )
+```
+
 o	Agent A calls Discovery.Lookup({requester_token: agentA_token, capability_filter:["tool:compute_pricing"]}) and finds Agent B’s endpoint.
+
 o	Agent A calls:
+```
 php
  
 ToolRequest({
@@ -398,14 +514,22 @@ ToolRequest({
   capability_token: <agentA_token>,
   agent_delegation_proof: <signed_payload>
 })
+```
+
 o	Agent B verifies the delegation proof (confirming Agent A allowed it to invoke compute_pricing), then uses its own logic + MPL calls (perhaps even calling MCP 2.0 to read historical sales). It returns:
+
+```
 text
  
 ToolResponse({
   success: true,
   outputs: { "recommended_price": <bytes representing float 37.95> }
 })
+
+```
+
 o	Agent A synthesizes the final answer for the end user.
+
 ________________________________________
 **5. Why This Is “Better” Than MCP 1.0**
 
