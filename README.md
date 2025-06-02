@@ -1014,13 +1014,13 @@ Notes on auth.py:
 
 -create_capability_token(...) issues a JWT containing:
 
-  -sub (subject, e.g. agent/server ID)
+  --sub (subject, e.g. agent/server ID)
 
-  -capabilities (list of strings like "db:inventory:read", "event:publish:inventory:*")
+  --capabilities (list of strings like "db:inventory:read", "event:publish:inventory:*")
 
-  -aud (audience list, e.g. ["InventoryDB_*"])
+  --aud (audience list, e.g. ["InventoryDB_*"])
 
-  -iat, exp (issued‐at & expiration)
+  --iat, exp (issued‐at & expiration)
 
 -verify_capability_token(token) decodes & verifies signature/expiry.
 
@@ -1030,10 +1030,683 @@ Notes on auth.py:
 
 ________________________________________
 
-________________________________________
+**6. Middleware Stubs (middleware.py)**
+
+In production, you’d likely add real logging/caching/circuit‐breaking logic. Here, we’ll provide stub classes and show how they might be invoked inside each server. Create mcp2_project/middleware.py:
+
+```
+
+# middleware.py
+import functools
+import time
+from typing import Any, Callable, Dict
+
+# ------------------------------------------------------------------
+# Telemetry Logger Stub
+# ------------------------------------------------------------------
+class TelemetryLogger:
+    def __init__(self):
+        # In prod, you might configure structured logging, metrics exports, etc.
+        pass
+
+    def log(self, entry: Dict[str, Any]):
+        """
+        A simple telemetry log. In production, send to a monitoring system.
+        entry could contain fields like:
+          - timestamp
+          - client_id
+          - method_name
+          - latency_ms
+          - status (success/failure)
+        """
+        print(f"[Telemetry] {time.strftime('%Y-%m-%d %H:%M:%S')} | {entry}")
+
+# ------------------------------------------------------------------
+# Caching Middleware Stub
+# ------------------------------------------------------------------
+class SimpleCache:
+    def __init__(self):
+        # In‐memory dict. Production might use Redis or Memcached.
+        self.store: Dict[str, Any] = {}
+
+    def get(self, key: str):
+        return self.store.get(key)
+
+    def set(self, key: str, value: Any, ttl: int = None):
+        # TTL handling omitted for simplicity.
+        self.store[key] = value
+
+# ------------------------------------------------------------------
+# Circuit Breaker Stub
+# ------------------------------------------------------------------
+class CircuitBreaker:
+    def __init__(self, threshold: int = 5, recovery_time: int = 60):
+        """
+        threshold: number of consecutive failures to open circuit
+        recovery_time: seconds after which we try to half‐open
+        """
+        self.threshold = threshold
+        self.recovery_time = recovery_time
+        self.failure_count = 0
+        self.last_failure_time = None
+        self.open = False
+
+    def before_call(self) -> bool:
+        """
+        Returns False if circuit is open and not recovered yet.
+        """
+        if self.open:
+            if time.time() - self.last_failure_time > self.recovery_time:
+                # half-open: let one request through
+                return True
+            return False
+        return True
+
+    def after_call(self, success: bool):
+        if success:
+            self.failure_count = 0
+            self.open = False
+        else:
+            self.failure_count += 1
+            self.last_failure_time = time.time()
+            if self.failure_count >= self.threshold:
+                self.open = True
+
+
+```
+
+**Integration Pattern:**
+
+In each RPC method, instantiate or reference a shared TelemetryLogger, SimpleCache, or CircuitBreaker and wrap the handler logic:
+
+```
+
+start = time.time()
+try:
+    if not circuit_breaker.before_call():
+        raise Exception("Circuit is open")
+    # [actual business logic here]
+    success = True
+except Exception as e:
+    success = False
+    raise
+finally:
+    latency_ms = int((time.time() - start) * 1000)
+    telemetry.log({
+        "method": "RequestContext",
+        "client": client_id,
+        "latency_ms": latency_ms,
+        "status": "success" if success else "failure"
+    })
+    circuit_breaker.after_call(success)
+
+
+```
+
+Caching: before performing expensive DB queries, do:
+
+```
+
+cache_key = f"context::{context_key}::{parameters_str}"
+cached = cache.get(cache_key)
+if cached is not None:
+    return cached
+# else compute, then cache.set(cache_key, response, ttl=60)
+
+
+```
 
 ________________________________________
+
+**7. Registry Service (registry_server.py)**
+
+This implements mcp2.Discovery with an in‐memory store. In production, replace with a persistent store (etcd/Consul). Create mcp2_project/registry_server.py:
+
+```
+
+# registry_server.py
+
+import threading
+from concurrent import futures
+import grpc
+import time
+
+import mcp2_pb2 as pb2
+import mcp2_pb2_grpc as pb2_grpc
+
+from auth import verify_capability_token, has_capability, has_audience
+from middleware import TelemetryLogger
+
+# ------------------------------------------------------------------
+# In‐Memory Registry Data Structures (Thread‐Safe)
+# ------------------------------------------------------------------
+class RegistryStore:
+    def __init__(self):
+        # server_name -> {"grpc_url": str, "capabilities": List[str], "registered_at": timestamp}
+        self._lock = threading.Lock()
+        self._store = {}
+
+    def register(self, server_name: str, grpc_url: str, capabilities: list):
+        with self._lock:
+            self._store[server_name] = {
+                "grpc_url": grpc_url,
+                "capabilities": capabilities,
+                "registered_at": time.time()
+            }
+
+    def lookup(self, capability_filter: list):
+        """
+        Return a list of (server_name, grpc_url, capabilities) for servers
+        whose capabilities match ANY of the requested capability_filter entries
+        (allow wildcard in registered capability).
+        """
+        out = []
+        with self._lock:
+            for name, info in self._store.items():
+                for cap in info["capabilities"]:
+                    for req in capability_filter:
+                        # exact match or wildcard match
+                        if cap == req or (cap.endswith("*") and req.startswith(cap[:-1])):
+                            out.append((name, info["grpc_url"], info["capabilities"]))
+                            break
+                    else:
+                        continue
+                    break
+        return out
+
+# Create a global registry store
+REGISTRY = RegistryStore()
+TELEMETRY = TelemetryLogger()
+
+# ------------------------------------------------------------------
+# Discovery Servicer Implementation
+# ------------------------------------------------------------------
+class DiscoveryServicer(pb2_grpc.DiscoveryServicer):
+    def Register(self, request, context):
+        """
+        Register a server or agent:
+          - Verify registration_token has capability "registry:register"
+          - Extract server_name, capabilities
+          - Store (server_name → {grpc_url, capabilities})
+        """
+        start_time = time.time()
+        client_peer = context.peer()
+        try:
+            # 1. Verify JWT
+            payload = verify_capability_token(request.registration_token)
+            # 2. Check that the token allows registering any service
+            if not has_capability(payload, "registry:register"):
+                context.abort(grpc.StatusCode.PERMISSION_DENIED, "Token lacks registry:register")
+
+            # 3. Extract fields and register
+            server_name = request.server_name
+            # We expect the registration payload to include a "grpc_url" entry in capabilities? 
+            # For simplicity, assume server_name encodes its grpc_url, or pass it via a metadata header.
+            # Here, we'll pretend the GRPC URL is passed as a metadata header "grpc-url"
+            grpc_url = None
+            for key, val in context.invocation_metadata():
+                if key == "grpc-url":
+                    grpc_url = val
+            if grpc_url is None:
+                context.abort(grpc.StatusCode.INVALID_ARGUMENT, "Missing 'grpc-url' metadata")
+
+            capabilities = list(request.capabilities)
+            REGISTRY.register(server_name, grpc_url, capabilities)
+
+            TELEM_ENTRY = {
+                "method": "Register",
+                "client": payload["sub"],
+                "server_name": server_name,
+                "latency_ms": int((time.time() - start_time) * 1000),
+                "status": "success"
+            }
+            TELEMETRY.log(TELEM_ENTRY)
+
+            return pb2.RegisterResponse(success=True, message="Registered successfully")
+        except Exception as e:
+            TELEM_ENTRY = {
+                "method": "Register",
+                "client": client_peer,
+                "latency_ms": int((time.time() - start_time) * 1000),
+                "status": f"failure: {e}"
+            }
+            TELEMETRY.log(TELEM_ENTRY)
+            context.abort(grpc.StatusCode.UNAUTHENTICATED, f"Registration failed: {e}")
+
+    def Lookup(self, request, context):
+        """
+        Lookup endpoints matching requested capability_filter:
+          - Verify requester_token has "registry:lookup" or relevant capabilities
+          - Return list of EndpointDescriptor
+        """
+        start_time = time.time()
+        try:
+            payload = verify_capability_token(request.requester_token)
+            if not has_capability(payload, "registry:lookup"):
+                context.abort(grpc.StatusCode.PERMISSION_DENIED, "Token lacks registry:lookup")
+
+            # Perform lookup
+            matches = REGISTRY.lookup(list(request.capability_filter))
+            endpoints = []
+            for (name, grpc_url, caps) in matches:
+                # Check if audience allows returning this endpoint to the requester
+                if has_audience(payload, name):
+                    endpoints.append(pb2.EndpointDescriptor(
+                        server_name=name,
+                        grpc_url=grpc_url,
+                        capabilities=caps
+                    ))
+            TELEM_ENTRY = {
+                "method": "Lookup",
+                "client": payload["sub"],
+                "latency_ms": int((time.time() - start_time) * 1000),
+                "status": f"found_{len(endpoints)}"
+            }
+            TELEMETRY.log(TELEM_ENTRY)
+
+            return pb2.LookupResponse(endpoints=endpoints)
+        except Exception as e:
+            TELEM_ENTRY = {
+                "method": "Lookup",
+                "client": context.peer(),
+                "latency_ms": int((time.time() - start_time) * 1000),
+                "status": f"failure: {e}"
+            }
+            TELEMETRY.log(TELEM_ENTRY)
+            context.abort(grpc.StatusCode.UNAUTHENTICATED, f"Lookup failed: {e}")
+
+# ------------------------------------------------------------------
+# Server Bootstrapping
+# ------------------------------------------------------------------
+def serve_registry():
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
+    pb2_grpc.add_DiscoveryServicer_to_server(DiscoveryServicer(), server)
+    listen_addr = '[::]:50050'
+    server.add_insecure_port(listen_addr)
+    print(f"[Registry] Listening on {listen_addr}")
+    server.start()
+    server.wait_for_termination()
+
+if __name__ == "__main__":
+    serve_registry()
+
+
+```
+
+-Notes on registry_server.py:
+
+  --REGISTRY.register(...) stores (server_name → {grpc_url, capabilities}). We require the client to pass its grpc_url via gRPC metadata ("grpc-url", "<its_url>").
+
+  --verify_capability_token(request.registration_token) ensures only authorized parties (with "registry:register") can register new endpoints.
+
+  --Lookup checks if the requester’s token has "registry:lookup" and then filters endpoints whose capabilities match at least one of request.capability_filter. It also ensures the JWT’s aud allows returning that particular server_name.
+
+  --Telemetry is logged via TelemetryLogger.log(...).
+
 ________________________________________
+
+**8. ContextTool Service (context_tool_server.py)**
+
+This service demonstrates each RPC method. We’ll simulate simple behavior (e.g., return static data, or echo back). Create mcp2_project/context_tool_server.py:
+
+```
+
+# context_tool_server.py
+
+import time
+import threading
+from concurrent import futures
+import grpc
+
+import mcp2_pb2 as pb2
+import mcp2_pb2_grpc as pb2_grpc
+
+from auth import verify_capability_token, has_capability, has_audience
+from middleware import TelemetryLogger, SimpleCache, CircuitBreaker
+
+# ------------------------------------------------------------------
+# In‐Memory Store & Telemetry & Cache & Circuit Breaker
+# ------------------------------------------------------------------
+TELEMETRY = TelemetryLogger()
+CACHE = SimpleCache()
+CIRCUIT = CircuitBreaker(threshold=3, recovery_time=30)
+
+# Example in-memory context data
+CONTEXT_DATA = {
+    "inventory:prod_12345:stock_count": b"42",  # serialized_value; real impl might be protobuf‐encoded
+}
+
+# Example telemetry subscribers: stream_id -> list of subscriber callbacks
+TELEMETRY_SUBSCRIBERS = {}
+TELEMETRY_LOCK = threading.Lock()
+SUBSCRIBER_ID_COUNTER = 0
+
+def publish_telemetry(stream_id: str, payload: bytes):
+    """
+    Called by some background thread to push telemetry to all subscribers
+    """
+    with TELEMETRY_LOCK:
+        subs = TELEMETRY_SUBSCRIBERS.get(stream_id, []).copy()
+    for callback in subs:
+        callback(payload)
+
+class ContextToolServicer(pb2_grpc.ContextToolServicer):
+    def RequestContext(self, request, context):
+        """
+        Unary RPC: Return serialized context for a given key.
+        Checks:
+          - capability_token has "db:inventory:read" (or wildcard)
+          - audience matches this server's name
+        Caching + Circuit Breaker applied.
+        """
+        start_time = time.time()
+        client_peer = context.peer()
+        server_name = "InventoryDB_Primary"  # Hardcoded for this example
+
+        try:
+            # 1. Check circuit breaker
+            if not CIRCUIT.before_call():
+                context.abort(grpc.StatusCode.UNAVAILABLE, "Service temporarily unavailable")
+
+            # 2. Verify token
+            payload = verify_capability_token(request.capability_token)
+            if not has_capability(payload, "db:inventory:read"):
+                context.abort(grpc.StatusCode.PERMISSION_DENIED, "Token lacks db:inventory:read")
+            if not has_audience(payload, server_name):
+                context.abort(grpc.StatusCode.PERMISSION_DENIED, f"Token not intended for {server_name}")
+
+            # 3. Caching check
+            cache_key = f"context::{request.context_key}::{tuple(sorted(request.parameters.items()))}"
+            cached = CACHE.get(cache_key)
+            if cached is not None:
+                TELEMETRY.log({
+                    "method": "RequestContext",
+                    "client": payload["sub"],
+                    "cache_hit": True,
+                    "latency_ms": int((time.time() - start_time) * 1000),
+                    "status": "success"
+                })
+                return cached
+
+            # 4. Fetch from in-memory store (simulate real DB)
+            value = CONTEXT_DATA.get(request.context_key, b"")
+            metadata = [f"timestamp:{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}"]
+
+            response = pb2.ContextResponse(
+                serialized_value=value,
+                metadata=metadata
+            )
+            # 5. Cache it
+            CACHE.set(cache_key, response, ttl=60)
+
+            CIRCUIT.after_call(success=True)
+            TELEMETRY.log({
+                "method": "RequestContext",
+                "client": payload["sub"],
+                "cache_hit": False,
+                "latency_ms": int((time.time() - start_time) * 1000),
+                "status": "success"
+            })
+            return response
+
+        except Exception as e:
+            CIRCUIT.after_call(success=False)
+            TELEMETRY.log({
+                "method": "RequestContext",
+                "client": client_peer,
+                "latency_ms": int((time.time() - start_time) * 1000),
+                "status": f"failure: {e}"
+            })
+            context.abort(grpc.StatusCode.UNAUTHENTICATED, f"RequestContext failed: {e}")
+
+    def SubscribeTelemetry(self, request, context):
+        """
+        Server-stream RPC: client subscribes to a telemetry stream.
+        Verifies capability_token and audience. Then pushes data via a queue.
+        """
+        start_time = time.time()
+        client_peer = context.peer()
+        server_name = "InventoryDB_Primary"  # Hardcoded server identity
+
+        try:
+            # 1. Verify token
+            payload = verify_capability_token(request.capability_token)
+            if not has_capability(payload, "telemetry:read"):
+                context.abort(grpc.StatusCode.PERMISSION_DENIED, "Token lacks telemetry:read")
+            if not has_audience(payload, server_name):
+                context.abort(grpc.StatusCode.PERMISSION_DENIED, f"Token not for {server_name}")
+
+            # 2. Register subscriber
+            stream_id = request.stream_id
+            subscriber_id = None
+            def callback(payload_bytes):
+                envelope = pb2.TelemetryFrame(
+                    timestamp_ms=int(time.time() * 1000),
+                    payload=payload_bytes
+                )
+                try:
+                    context.write(envelope)
+                except grpc.RpcError:
+                    pass  # client disconnected
+
+            with TELEMETRY_LOCK:
+                global SUBSCRIBER_ID_COUNTER
+                SUBSCRIBER_ID_COUNTER += 1
+                subscriber_id = SUBSCRIBER_ID_COUNTER
+                TELEMETRY_SUBSCRIBERS.setdefault(stream_id, []).append(callback)
+
+            TELEMETRY.log({
+                "method": "SubscribeTelemetry.start",
+                "client": payload["sub"],
+                "stream_id": stream_id,
+                "latency_ms": int((time.time() - start_time) * 1000),
+                "status": "subscribed"
+            })
+
+            # 3. Keep the stream open until client cancels
+            while True:
+                if context.is_active():
+                    time.sleep(0.1)
+                    continue
+                else:
+                    break
+
+        except Exception as e:
+            TELEMETRY.log({
+                "method": "SubscribeTelemetry",
+                "client": client_peer,
+                "latency_ms": int((time.time() - start_time) * 1000),
+                "status": f"failure: {e}"
+            })
+            context.abort(grpc.StatusCode.UNAUTHENTICATED, f"SubscribeTelemetry failed: {e}")
+        finally:
+            # Cleanup subscriber
+            if subscriber_id is not None:
+                with TELEMETRY_LOCK:
+                    callbacks = TELEMETRY_SUBSCRIBERS.get(request.stream_id, [])
+                    TELEMETRY_SUBSCRIBERS[request.stream_id] = [
+                        cb for cb in callbacks if cb != callback
+                    ]
+
+    def MultiModalExchange(self, request_iterator, context):
+        """
+        Bidirectional streaming RPC: both sides send MultiModalFrame messages.
+        Here, we simply echo back each received frame (in real world, apply some processing).
+        """
+        start_time = time.time()
+        client_peer = context.peer()
+        server_name = "InventoryDB_Primary"
+
+        # For simplicity, skip token check on each frame; assume the first frame's token is valid
+        first = True
+        payload = None
+        try:
+            for mm_frame in request_iterator:
+                if first:
+                    # We expect the client to send a TextChunk with their token in metadata
+                    md = dict(context.invocation_metadata())
+                    token = md.get("capability_token")
+                    if not token:
+                        context.abort(grpc.StatusCode.PERMISSION_DENIED, "Missing capability_token in metadata")
+                    payload = verify_capability_token(token)
+                    if not has_capability(payload, "tool:multimodal_exchange"):
+                        context.abort(grpc.StatusCode.PERMISSION_DENIED, "Token lacks tool:multimodal_exchange")
+                    if not has_audience(payload, server_name):
+                        context.abort(grpc.StatusCode.PERMISSION_DENIED, f"Token not for {server_name}")
+                    first = False
+
+                # Echo back the same frame (could apply real transforms in production)
+                yield mm_frame
+
+            TELEMETRY.log({
+                "method": "MultiModalExchange",
+                "client": payload["sub"] if payload else client_peer,
+                "latency_ms": int((time.time() - start_time) * 1000),
+                "status": "completed"
+            })
+        except Exception as e:
+            TELEMETRY.log({
+                "method": "MultiModalExchange",
+                "client": client_peer,
+                "latency_ms": int((time.time() - start_time) * 1000),
+                "status": f"failure: {e}"
+            })
+            context.abort(grpc.StatusCode.UNAUTHENTICATED, f"MultiModalExchange failed: {e}")
+
+    def InvokeTool(self, request, context):
+        """
+        Unary RPC: invoke a named tool (e.g., "enhance_image" or "compute_pricing").
+        Verifies token, then calls a fake tool.
+        """
+        start_time = time.time()
+        client_peer = context.peer()
+        server_name = "InventoryDB_Primary"
+
+        try:
+            # 1. Circuit breaker
+            if not CIRCUIT.before_call():
+                context.abort(grpc.StatusCode.UNAVAILABLE, "Service temporarily unavailable")
+
+            # 2. Verify token + delegation proof if present
+            payload = verify_capability_token(request.capability_token)
+            tool_name = request.tool_name
+            required_cap = f"tool:{tool_name}"
+            if not has_capability(payload, required_cap):
+                context.abort(grpc.StatusCode.PERMISSION_DENIED, f"Token lacks {required_cap}")
+            if not has_audience(payload, server_name):
+                context.abort(grpc.StatusCode.PERMISSION_DENIED, f"Token not for {server_name}")
+
+            # 3. Simulate tool execution (e.g., echo arguments back)
+            outputs = {}
+            warnings = []
+            if tool_name == "compute_pricing":
+                sku = request.arguments.get("sku", "")
+                stock = int(request.arguments.get("stock_count", "0"))
+                recommended_price = 100.0 - 0.1 * stock  # dummy formula
+                outputs["recommended_price"] = str(recommended_price).encode("utf-8")
+            else:
+                warnings.append(f"Tool '{tool_name}' not recognized. No action taken.")
+
+            resp = pb2.ToolResponse(
+                success=True,
+                outputs=outputs,
+                warnings=warnings
+            )
+            CIRCUIT.after_call(success=True)
+            TELEMETRY.log({
+                "method": "InvokeTool",
+                "client": payload["sub"],
+                "tool": tool_name,
+                "latency_ms": int((time.time() - start_time) * 1000),
+                "status": "success"
+            })
+            return resp
+
+        except Exception as e:
+            CIRCUIT.after_call(success=False)
+            TELEMETRY.log({
+                "method": "InvokeTool",
+                "client": client_peer,
+                "latency_ms": int((time.time() - start_time) * 1000),
+                "status": f"failure: {e}"
+            })
+            context.abort(grpc.StatusCode.UNAUTHENTICATED, f"InvokeTool failed: {e}")
+
+# ------------------------------------------------------------------
+# Server Bootstrapping
+# ------------------------------------------------------------------
+def serve_context_tool():
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
+    pb2_grpc.add_ContextToolServicer_to_server(ContextToolServicer(), server)
+    listen_addr = '[::]:50051'
+    server.add_insecure_port(listen_addr)
+    print(f"[ContextTool] Listening on {listen_addr}")
+    server.start()
+
+    # For demonstration: start a background thread that pushes telemetry every 5 seconds
+    def telemetry_pusher():
+        while True:
+            time.sleep(5)
+            # Simulate a telemetry payload for stream "fleet123:engine_temp"
+            payload = b'{"engine_temp": %d}' % (70 + int(time.time()) % 10)
+            publish_telemetry("fleet123:engine_temp", payload)
+
+    t = threading.Thread(target=telemetry_pusher, daemon=True)
+    t.start()
+
+    server.wait_for_termination()
+
+if __name__ == "__main__":
+    serve_context_tool()
+
+
+```
+
+
+Key Points in context_tool_server.py:
+
+
+•	RequestContext
+
+
+o	Uses CircuitBreaker to gate calls.
+
+o	Verifies JWT for "db:inventory:read".
+
+o	Checks audience matches this server’s name ("InventoryDB_Primary").
+
+o	Caches responses in SimpleCache.
+
+•	SubscribeTelemetry
+
+o	Verifies "telemetry:read" capability.
+
+o	Registers a callback in TELEMETRY_SUBSCRIBERS[stream_id], which is called by a background thread (telemetry_pusher) to broadcast new telemetry.
+
+•	MultiModalExchange
+
+o	Expects the first incoming frame’s metadata to include ("capability_token", <token>).
+
+o	Verifies "tool:multimodal_exchange" capability.
+
+o	Simply echoes each frame back.
+
+•	InvokeTool
+
+o	Verifies "tool:{tool_name}" capability.
+
+o	Simulates a pricing formula if tool_name=="compute_pricing".
+
+o	Returns a ToolResponse containing a recommended_price (dummy).
+
+
+
+________________________________________
+
+
+
+
+
 ________________________________________
 ________________________________________
 ________________________________________
