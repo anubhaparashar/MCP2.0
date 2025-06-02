@@ -1,4 +1,29 @@
 # MCP2.0
+
+```
+
+
+mcp2_project/
+├─ protos/
+│   └─ mcp2.proto
+│
+├─ auth.py
+├─ middleware.py
+│
+├─ registry_server.py
+├─ context_tool_server.py
+├─ event_bus_server.py
+│
+├─ client_example.py
+└─ requirements.txt
+
+
+
+```
+
+
+
+
 **1. Key Limitations of MCP**
 
 **1.	JSON-RPC Overhead & Lack of IPA-Grade Typing**
